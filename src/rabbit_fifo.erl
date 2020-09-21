@@ -59,7 +59,8 @@
          make_credit/4,
          make_purge/0,
          make_purge_nodes/1,
-         make_update_config/1
+         make_update_config/1,
+         make_garbage_collection/0
         ]).
 
 %% command records representing all the protocol actions that are supported
@@ -83,6 +84,7 @@
 -record(purge, {}).
 -record(purge_nodes, {nodes :: [node()]}).
 -record(update_config, {config :: config()}).
+-record(garbage_collection, {}).
 
 -opaque protocol() ::
     #enqueue{} |
@@ -94,7 +96,8 @@
     #credit{} |
     #purge{} |
     #purge_nodes{} |
-    #update_config{}.
+    #update_config{} |
+    #garbage_collection{}.
 
 -type command() :: protocol() | ra_machine:builtin_command().
 %% all the command types supported by ra fifo
@@ -754,25 +757,25 @@ init_aux(Name) when is_atom(Name) ->
          utilisation = {inactive, Now, 1, 1.0}}.
 
 handle_aux(_RaState, cast, eval, Aux0, Log, _MacState) ->
-                                     utilisation = Use0} = State0,	    {no_reply, Aux0, Log};
+    {no_reply, Aux0, Log};
 handle_aux(_RaState, cast, Cmd, #aux{utilisation = Use0} = Aux0,
            Log, _MacState)
   when Cmd == active orelse Cmd == inactive ->
     {no_reply, Aux0#aux{utilisation = update_use(Use0, Cmd)}, Log};
 handle_aux(_RaState, cast, tick, #aux{name = Name,
                                       utilisation = Use0} = State0,
-           Log, MacState) ->	           Log, MacState) ->
-    State = case Cmd of	    true = ets:insert(rabbit_fifo_usage,
-              _ when Cmd == active orelse Cmd == inactive ->	                      {Name, utilisation(Use0)}),
-                  State0#aux{utilisation = update_use(Use0, Cmd)};	    Aux = eval_gc(Log, MacState, State0),
-              tick ->	    {no_reply, Aux, Log};
-                  true = ets:insert(rabbit_fifo_usage,	handle_aux(_RaState, {call, _From}, {peek, Pos}, Aux0,
-                                    {Name, utilisation(Use0)}),	           Log0, MacState) ->
-                  eval_gc(Log, MacState, State0);	    case rabbit_fifo:query_peek(Pos, MacState) of
-              eval ->	        {ok, {Idx, {Header, empty}}} ->
-                  State0	            %% need to re-hydrate from the log
-          end,	           {{_, _, {_, _, Cmd, _}}, Log} = ra_log:fetch(Idx, Log0),
-    {no_reply, State, Log}.	           #enqueue{msg = Msg} = Cmd,
+           Log, MacState) ->
+    true = ets:insert(rabbit_fifo_usage,
+                      {Name, utilisation(Use0)}),
+    Aux = eval_gc(Log, MacState, State0),
+    {no_reply, Aux, Log};
+handle_aux(_RaState, {call, _From}, {peek, Pos}, Aux0,
+           Log0, MacState) ->
+    case rabbit_fifo:query_peek(Pos, MacState) of
+        {ok, {Idx, {Header, empty}}} ->
+            %% need to re-hydrate from the log
+           {{_, _, {_, _, Cmd, _}}, Log} = ra_log:fetch(Idx, Log0),
+           #enqueue{msg = Msg} = Cmd,
            {reply, {ok, {Header, Msg}}, Aux0, Log};
         {ok, {_Idx, {Header, Msg}}} ->
            {reply, {ok, {Header, Msg}}, Aux0, Log0};
@@ -784,9 +787,7 @@ handle_aux(leader, _, garbage_collection, State, Log, _MacState) ->
     {no_reply, State, Log};
 handle_aux(follower, _, garbage_collection, State, Log, MacState) ->
     ra_log_wal:force_roll_over(ra_log_wal),
-    {no_reply, force_eval_gc(Log, MacState, State), Log};
-handle_aux(_RaState, cast, Cmd, #aux{name = Name,
-                                     utilisation = Use0} = State0,
+    {no_reply, force_eval_gc(Log, MacState, State), Log}.
 
 eval_gc(Log, #?MODULE{cfg = #cfg{resource = QR}} = MacState,
         #aux{gc = #aux_gc{last_raft_idx = LastGcIdx} = Gc} = AuxState) ->
@@ -906,6 +907,17 @@ query_consumers(#?MODULE{consumers = Consumers,
                     end, #{}, WaitingConsumers),
     maps:merge(FromConsumers, FromWaitingConsumers).
 
+query_peek(Pos, State0) when Pos > 0 ->
+    case take_next_msg(State0) of
+        empty ->
+            {error, no_message_at_pos};
+        {{_Seq, IdxMsg}, _State}
+          when Pos == 1 ->
+            {ok, IdxMsg};
+        {_Msg, State} ->
+            query_peek(Pos-1, State)
+    end.
+
 query_single_active_consumer(#?MODULE{cfg = #cfg{consumer_strategy = single_active},
                                       consumers = Consumers}) ->
     case maps:size(Consumers) of
@@ -926,18 +938,6 @@ query_stat(#?MODULE{consumers = Consumers} = State) ->
 query_in_memory_usage(#?MODULE{msg_bytes_in_memory = Bytes,
                                msgs_ready_in_memory = Length}) ->
     {Length, Bytes}.
-
-query_peek(Pos, State0) when Pos > 0 ->
-    case take_next_msg(State0) of
-        empty ->
-            {error, no_message_at_pos};
-        {{_Seq, IdxMsg}, _State}
-          when Pos == 1 ->
-            {ok, IdxMsg};
-        {_Msg, State} ->
-            query_peek(Pos-1, State)
-    end.
-
 
 -spec usage(atom()) -> float().
 usage(Name) when is_atom(Name) ->
@@ -1941,6 +1941,9 @@ make_credit(ConsumerId, Credit, DeliveryCount, Drain) ->
 
 -spec make_purge() -> protocol().
 make_purge() -> #purge{}.
+
+-spec make_garbage_collection() -> protocol().
+make_garbage_collection() -> #garbage_collection{}.
 
 -spec make_purge_nodes([node()]) -> protocol().
 make_purge_nodes(Nodes) ->
