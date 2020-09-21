@@ -41,6 +41,7 @@
 -export([repair_amqqueue_nodes/1,
          repair_amqqueue_nodes/2
          ]).
+-export([reclaim_memory/2]).
 
 -include_lib("stdlib/include/qlc.hrl").
 -include("rabbit.hrl").
@@ -103,7 +104,6 @@ handle_event({ra_event, From, Evt}, QState) ->
     {new | existing, amqqueue:amqqueue()} | rabbit_types:channel_exit().
 
 declare(Q) when ?amqqueue_is_quorum(Q) ->
-    rabbit_log:info("quorum_queue declaring ~w", [Q]),
     QName = amqqueue:get_name(Q),
     Durable = amqqueue:is_durable(Q),
     AutoDelete = amqqueue:is_auto_delete(Q),
@@ -1112,6 +1112,19 @@ file_handle_other_reservation() ->
 
 file_handle_release_reservation() ->
     file_handle_cache:release_reservation().
+
+-spec reclaim_memory(rabbit_types:vhost(), Name :: rabbit_misc:resource_name()) -> ok | {error, term()}.
+reclaim_memory(Vhost, QueueName) ->
+    QName = #resource{virtual_host = Vhost, name = QueueName, kind = queue},
+    case rabbit_amqqueue:lookup(QName) of
+        {ok, Q} when ?amqqueue_is_classic(Q) ->
+            {error, classic_queue_not_supported};
+        {ok, Q} when ?amqqueue_is_quorum(Q) ->
+            ok = ra:pipeline_command(amqqueue:get_pid(Q),
+                                     rabbit_fifo:make_garbage_collection());
+        {error, not_found} = E ->
+            E
+    end.
 
 %%----------------------------------------------------------------------------
 dlx_mfa(Q) ->
